@@ -1,0 +1,166 @@
+#!/usr/bin/env bb
+;; Minimal MCP (stdio) server exposing Godspeed to Claude Desktop.
+;; stdout is reserved for JSON-RPC; never println anything else.
+
+(ns gs-mcp
+  (:require [babashka.http-client :as http]
+            [cheshire.core :as json]
+            [clojure.string :as str]))
+
+(def base-url "https://api.godspeedapp.com")
+
+(defn headers []
+  {"Authorization" (str "Bearer " (System/getenv "GODSPEED_API_KEY"))
+   "Content-Type" "application/json"})
+
+(defn api [method path & {:keys [params body]}]
+  (let [resp (http/request {:method method
+                            :uri (str base-url path)
+                            :headers (headers)
+                            :query-params (or params {})
+                            :body (when body (json/generate-string body))})]
+    (some-> (:body resp) not-empty (json/parse-string true))))
+
+(defn fetch-lists []
+  (let [r (api :get "/lists")] (or (:lists r) r [])))
+
+(defn fetch-tasks [status list-id]
+  (let [r (api :get "/tasks" :params (cond-> {"status" (or status "incomplete") "limit" "250"}
+                                       list-id (assoc "list_id" list-id)))]
+    (or (:tasks r) r [])))
+
+(defn fetch-labels []
+  (let [r (api :get "/labels")] (or (:labels r) r [])))
+
+(defn local-date [timeless at]
+  (or timeless
+      (some-> at java.time.Instant/parse
+              (.atZone (java.time.ZoneId/systemDefault))
+              .toLocalDate str)))
+
+(defn due-date [t] (local-date (:timeless_due_at t) (:due_at t)))
+(defn start-date [t] (local-date (:timeless_starts_at t) (:starts_at t)))
+
+;; Mirrors the "My today" smart list: label:wip | due<=today | has:start & start<=today
+(defn today-task? [t wip-id today]
+  (let [due (due-date t) start (start-date t)]
+    (boolean
+     (or (and wip-id (some #{wip-id} (:label_ids t)))
+         (and due (<= (compare due today) 0))
+         (and start (<= (compare start today) 0))))))
+
+(defn resolve-list-id [name lists]
+  (or (some #(when (= (:name %) name) (:id %)) lists)
+      (some #(when (= (str/lower-case (or (:name %) "")) (str/lower-case name)) (:id %)) lists)))
+
+(defn lookup-list-id [name]
+  (or (resolve-list-id name (fetch-lists))
+      (throw (ex-info (str "List not found: " name) {}))))
+
+;; --- Tools ---
+(def tools
+  [{:name "list_lists"
+    :description "List Godspeed lists (including the inbox) by name and id."
+    :inputSchema {:type "object" :properties {}}
+    :handler (fn [_]
+               (->> (fetch-lists)
+                    (filter #(#{"list" "inbox"} (:list_type %)))
+                    (map #(select-keys % [:id :name]))))}
+   {:name "list_tasks"
+    :description "List tasks, sorted by order. indent_level shows subtask nesting. Max 250 tasks."
+    :inputSchema {:type "object"
+                  :properties {:list {:type "string" :description "List name (optional)"}
+                               :status {:type "string" :enum ["incomplete" "complete"]}}}
+    :handler (fn [{:keys [list status]}]
+               (let [lists (fetch-lists)
+                     list-id (when list (lookup-list-id list))]
+                 (->> (fetch-tasks status list-id)
+                      (sort-by :order_index)
+                      (map (fn [t]
+                             {:id (:id t)
+                              :title (:title t)
+                              :due (or (:timeless_due_at t) (:due_at t))
+                              :indent_level (:indent_level t)
+                              :list (some #(when (= (:id %) (:list_id t)) (:name %)) lists)})))))}
+   {:name "today_tasks"
+    :description "Tasks that are actionable now (mirrors the 'My today' smart list): labelled wip, due today or overdue, or start date reached. Sorted by due date."
+    :inputSchema {:type "object" :properties {}}
+    :handler (fn [_]
+               (let [lists (fetch-lists)
+                     wip-id (some #(when (= "wip" (str/lower-case (or (:name %) ""))) (:id %)) (fetch-labels))
+                     today (str (java.time.LocalDate/now))]
+                 (->> (fetch-tasks nil nil)
+                      (filter #(today-task? % wip-id today))
+                      (sort-by #(or (due-date %) "9999"))
+                      (map (fn [t]
+                             {:id (:id t)
+                              :title (:title t)
+                              :due (due-date t)
+                              :start (start-date t)
+                              :list (some #(when (= (:id %) (:list_id t)) (:name %)) lists)})))))}
+   {:name "add_task"
+    :description "Create a task."
+    :inputSchema {:type "object"
+                  :properties {:title {:type "string"}
+                               :list {:type "string" :description "List name (default: inbox)"}
+                               :due {:type "string" :description "YYYY-MM-DD"}
+                               :notes {:type "string"}}
+                  :required ["title"]}
+    :handler (fn [{:keys [title list due notes]}]
+               (api :post "/tasks"
+                    :body (cond-> {:title title}
+                            list (assoc :list_id (lookup-list-id list))
+                            due (assoc :timeless_due_at due)
+                            notes (assoc :notes notes)))
+               (str "Created: " title))}
+   {:name "complete_task"
+    :description "Mark a task complete by id (get ids from list_tasks)."
+    :inputSchema {:type "object" :properties {:id {:type "string"}} :required ["id"]}
+    :handler (fn [{:keys [id]}]
+               (api :patch (str "/tasks/" id) :body {:is_complete true})
+               (str "Completed: " id))}
+   {:name "delete_task"
+    :description "Permanently delete a task by id (get ids from list_tasks)."
+    :inputSchema {:type "object" :properties {:id {:type "string"}} :required ["id"]}
+    :handler (fn [{:keys [id]}]
+               (api :delete (str "/tasks/" id))
+               (str "Deleted: " id))}])
+
+(def tools-by-name (into {} (map (juxt :name identity) tools)))
+
+(defn call-tool [{:keys [name arguments]}]
+  (if-let [{:keys [handler]} (tools-by-name name)]
+    (try
+      (let [r (handler arguments)]
+        {:content [{:type "text" :text (if (string? r) r (json/generate-string r))}]})
+      (catch Exception e
+        {:isError true :content [{:type "text" :text (str "Error: " (ex-message e))}]}))
+    {:isError true :content [{:type "text" :text (str "Unknown tool: " name)}]}))
+
+;; --- JSON-RPC ---
+(defn respond [id result]
+  (println (json/generate-string {:jsonrpc "2.0" :id id :result result}))
+  (flush))
+
+(defn respond-error [id code msg]
+  (println (json/generate-string {:jsonrpc "2.0" :id id :error {:code code :message msg}}))
+  (flush))
+
+(defn handle [{:keys [id method params]}]
+  (case method
+    "initialize" (respond id {:protocolVersion (or (:protocolVersion params) "2024-11-05")
+                              :capabilities {:tools {}}
+                              :serverInfo {:name "godspeed" :version "0.1.0"}})
+    "tools/list" (respond id {:tools (map #(dissoc % :handler) tools)})
+    "tools/call" (respond id (call-tool params))
+    "ping"       (respond id {})
+    ;; notifications (no id) get no reply; unknown requests get an error
+    (when id (respond-error id -32601 (str "Method not found: " method)))))
+
+(when-not (System/getenv "GODSPEED_API_KEY")
+  (binding [*out* *err*] (println "GODSPEED_API_KEY not set"))
+  (System/exit 1))
+
+(doseq [line (line-seq (java.io.BufferedReader. *in*))
+        :when (not (str/blank? line))]
+  (handle (json/parse-string line true)))
