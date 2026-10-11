@@ -1,0 +1,18 @@
+# Claude Code / agent-local artifacts
+.claude/
+memory/
+
+# Local CA bundle (may be referenced via $GODSPEED_CA_BUNDLE)
+*.pem
+
+# Babashka / Clojure
+.cpcache/
+.clj-kondo/.cache/
+.lsp/.cache/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
