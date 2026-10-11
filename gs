@@ -3,7 +3,12 @@
 (ns gs
   (:require [babashka.http-client :as http]
             [cheshire.core :as json]
-            [clojure.string :as str]))
+            [clojure.java.shell :as shell]
+            [clojure.string :as str])
+  (:import [java.io ByteArrayInputStream]
+           [java.security KeyStore]
+           [java.security.cert CertificateFactory]
+           [javax.net.ssl SSLContext TrustManagerFactory]))
 
 ;; --- Config ---
 (def base-url "https://api.godspeedapp.com")
@@ -17,28 +22,75 @@
   {"Authorization" (str "Bearer " (api-key))
    "Content-Type" "application/json"})
 
+;; --- TLS / corporate proxy support ---
+;; Behind a TLS-intercepting proxy (e.g. Zscaler) the server cert is re-signed
+;; by a corporate root CA that lives in the OS keychain, not in bb's bundled
+;; truststore, so handshakes fail with "PKIX path building failed". We build an
+;; SSLContext whose truststore is sourced from $GODSPEED_CA_BUNDLE (a PEM file)
+;; or, on macOS, the keychains: SystemRootCertificates (the public roots) plus
+;; System (where the corporate root lives). Returns nil elsewhere so callers
+;; fall back to bb's default client.
+(def ^:private mac-keychains
+  ["/System/Library/Keychains/SystemRootCertificates.keychain"
+   "/Library/Keychains/System.keychain"])
+
+(defn- read-pem-certs [pem]
+  (when-not (str/blank? pem)
+    (let [cf (CertificateFactory/getInstance "X.509")]
+      (with-open [in (ByteArrayInputStream. (.getBytes pem "UTF-8"))]
+        (vec (.generateCertificates cf in))))))
+
+(defn- ca-certs []
+  (try
+    (if-let [bundle (System/getenv "GODSPEED_CA_BUNDLE")]
+      (read-pem-certs (slurp bundle))
+      (when (str/includes? (str/lower-case (System/getProperty "os.name" "")) "mac")
+        (mapcat (fn [kc]
+                  (let [{:keys [exit out]} (shell/sh "security" "find-certificate" "-a" "-p" kc)]
+                    (when (zero? exit) (read-pem-certs out))))
+                mac-keychains)))
+    (catch Exception _ nil)))
+
+(defn- ssl-context
+  "An SSLContext trusting the resolved CA certs, or nil if none are available
+   (callers then fall back to bb's default client)."
+  []
+  (when-let [certs (seq (ca-certs))]
+    (let [ks (doto (KeyStore/getInstance (KeyStore/getDefaultType)) (.load nil nil))]
+      (doseq [[i c] (map-indexed vector certs)]
+        (.setCertificateEntry ks (str "ca-" i) c))
+      (let [tmf (doto (TrustManagerFactory/getInstance (TrustManagerFactory/getDefaultAlgorithm))
+                  (.init ks))]
+        (doto (SSLContext/getInstance "TLS") (.init nil (.getTrustManagers tmf) nil))))))
+
+(def ^:private http-client
+  (delay (when-let [ctx (ssl-context)] (http/client {:ssl-context ctx}))))
+
+(defn- with-client [opts]
+  (if-let [c @http-client] (assoc opts :client c) opts))
+
 ;; --- HTTP helpers ---
 (defn GET [path & {:keys [params]}]
   (let [url (str base-url path)
-        resp (http/get url {:headers (auth-headers)
-                            :query-params (or params {})})]
+        resp (http/get url (with-client {:headers (auth-headers)
+                                         :query-params (or params {})}))]
     (json/parse-string (:body resp) true)))
 
 (defn POST [path body]
   (let [url (str base-url path)
-        resp (http/post url {:headers (auth-headers)
-                             :body (json/generate-string body)})]
+        resp (http/post url (with-client {:headers (auth-headers)
+                                          :body (json/generate-string body)}))]
     (json/parse-string (:body resp) true)))
 
 (defn PATCH [path body]
   (let [url (str base-url path)
-        resp (http/patch url {:headers (auth-headers)
-                              :body (json/generate-string body)})]
+        resp (http/patch url (with-client {:headers (auth-headers)
+                                           :body (json/generate-string body)}))]
     (json/parse-string (:body resp) true)))
 
 (defn DELETE [path]
   (let [url (str base-url path)]
-    (http/delete url {:headers (auth-headers)})))
+    (http/delete url (with-client {:headers (auth-headers)}))))
 
 ;; --- Task helpers ---
 (defn fetch-tasks [& {:keys [status list-id]}]

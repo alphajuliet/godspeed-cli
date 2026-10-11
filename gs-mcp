@@ -5,7 +5,12 @@
 (ns gs-mcp
   (:require [babashka.http-client :as http]
             [cheshire.core :as json]
-            [clojure.string :as str]))
+            [clojure.java.shell :as shell]
+            [clojure.string :as str])
+  (:import [java.io ByteArrayInputStream]
+           [java.security KeyStore]
+           [java.security.cert CertificateFactory]
+           [javax.net.ssl SSLContext TrustManagerFactory]))
 
 (def base-url "https://api.godspeedapp.com")
 
@@ -13,12 +18,54 @@
   {"Authorization" (str "Bearer " (System/getenv "GODSPEED_API_KEY"))
    "Content-Type" "application/json"})
 
+;; --- TLS / corporate proxy support ---
+;; Behind a TLS-intercepting proxy (e.g. Zscaler) the server cert is re-signed
+;; by a corporate root CA that lives in the OS keychain, not in bb's bundled
+;; truststore, so handshakes fail with "PKIX path building failed". We build an
+;; SSLContext whose truststore is sourced from $GODSPEED_CA_BUNDLE (a PEM file)
+;; or, on macOS, the keychains: SystemRootCertificates (the public roots) plus
+;; System (where the corporate root lives). Returns nil elsewhere so callers
+;; fall back to bb's default client.
+(def ^:private mac-keychains
+  ["/System/Library/Keychains/SystemRootCertificates.keychain"
+   "/Library/Keychains/System.keychain"])
+
+(defn- read-pem-certs [pem]
+  (when-not (str/blank? pem)
+    (let [cf (CertificateFactory/getInstance "X.509")]
+      (with-open [in (ByteArrayInputStream. (.getBytes pem "UTF-8"))]
+        (vec (.generateCertificates cf in))))))
+
+(defn- ca-certs []
+  (try
+    (if-let [bundle (System/getenv "GODSPEED_CA_BUNDLE")]
+      (read-pem-certs (slurp bundle))
+      (when (str/includes? (str/lower-case (System/getProperty "os.name" "")) "mac")
+        (mapcat (fn [kc]
+                  (let [{:keys [exit out]} (shell/sh "security" "find-certificate" "-a" "-p" kc)]
+                    (when (zero? exit) (read-pem-certs out))))
+                mac-keychains)))
+    (catch Exception _ nil)))
+
+(defn- ssl-context []
+  (when-let [certs (seq (ca-certs))]
+    (let [ks (doto (KeyStore/getInstance (KeyStore/getDefaultType)) (.load nil nil))]
+      (doseq [[i c] (map-indexed vector certs)]
+        (.setCertificateEntry ks (str "ca-" i) c))
+      (let [tmf (doto (TrustManagerFactory/getInstance (TrustManagerFactory/getDefaultAlgorithm))
+                  (.init ks))]
+        (doto (SSLContext/getInstance "TLS") (.init nil (.getTrustManagers tmf) nil))))))
+
+(def ^:private http-client
+  (delay (when-let [ctx (ssl-context)] (http/client {:ssl-context ctx}))))
+
 (defn api [method path & {:keys [params body]}]
-  (let [resp (http/request {:method method
-                            :uri (str base-url path)
-                            :headers (headers)
-                            :query-params (or params {})
-                            :body (when body (json/generate-string body))})]
+  (let [resp (http/request (cond-> {:method method
+                                    :uri (str base-url path)
+                                    :headers (headers)
+                                    :query-params (or params {})
+                                    :body (when body (json/generate-string body))}
+                             @http-client (assoc :client @http-client)))]
     (some-> (:body resp) not-empty (json/parse-string true))))
 
 (defn fetch-lists []

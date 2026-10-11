@@ -42,6 +42,19 @@ If Desktop can't find `bb`, use `"command": "/opt/homebrew/bin/bb"` with `"args"
 - Due dates: read `timeless_due_at` (date-only) or `due_at` (timed); create with `timeless_due_at`. A `due_date` field is silently ignored by the API (verified).
 - Known issue: `gs add --label` sends `label`, which the API silently ignores (verified); tasks have `label_ids` (UUIDs), so labels need a name→id lookup that isn't implemented.
 
+### TLS / corporate proxy (Zscaler)
+
+Babashka runs on a GraalVM native image with its own bundled CA truststore and does **not** consult the macOS keychain. Behind a TLS-intercepting proxy (e.g. Deloitte's Zscaler) the server cert for `api.godspeedapp.com` is re-signed by a corporate root CA that lives in the keychain but not in bb's truststore, so every HTTPS call fails the handshake with `javax.net.ssl.SSLHandshakeException: PKIX path building failed`. `curl`/Safari work because they use the keychain; `bb` doesn't.
+
+Both scripts build a custom `SSLContext` to work around this (functions `read-pem-certs` / `ca-certs` / `ssl-context`, a memoized `http-client` delay, and — in `gs` — a `with-client` helper that injects the client into each request; `gs-mcp` injects it in `api`). The truststore is sourced from:
+
+1. `$GODSPEED_CA_BUNDLE` — path to a PEM file; if set, used exclusively. The portable escape hatch (non-macOS, or to pin a specific bundle).
+2. Otherwise, on macOS only: certs exported via `security find-certificate -a -p` from `SystemRootCertificates.keychain` (the ~158 public roots) **plus** `System.keychain` (where the corporate root lives). Loading the public roots too means `gs` still works when off the proxy.
+
+On non-macOS with no `$GODSPEED_CA_BUNDLE`, `ssl-context` returns `nil` and calls fall back to bb's default client — behaviour is unchanged there.
+
+Gotcha: we build the truststore from these certs directly rather than augmenting bb's defaults, because sci can't resolve the `TrustManagerFactory.init((KeyStore) null)` overload — passing `nil` throws. This is why we load the full public root set from the keychain instead of merging with bb's bundled CAs. Keep this fix in sync across both `gs` and `gs-mcp`.
+
 ### Task hierarchy
 
 Tasks have no `parent_id`. Subtask relationships are encoded positionally via `order_index` (sort order) and `indent_level` (nesting depth). To display hierarchy, sort by `order_index` and indent by `indent_level` relative to the minimum level in the result set.
