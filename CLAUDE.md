@@ -36,13 +36,14 @@ If Desktop can't find `bb`, use `"command": "/opt/homebrew/bin/bb"` with `"args"
 
 - Base URL: `https://api.godspeedapp.com`
 - Auth: `Authorization: Bearer $GODSPEED_API_KEY`
-- Endpoints used: `GET /tasks`, `POST /tasks`, `PATCH /tasks/{id}`, `DELETE /tasks/{id}`, `GET /lists`
+- Endpoints used: `GET /tasks`, `POST /tasks`, `PATCH /tasks/{id}`, `DELETE /tasks/{id}`, `GET /lists`, `GET /labels`
 - `GET /tasks` is called with `status` (default `incomplete`) and `limit=250`; the response has no cursor/next field (keys: `success`, `tasks`, `lists`, `labels` — note it also embeds lists and labels), so results beyond 250 are not seen. `fetch-tasks` warns on stderr when exactly 250 come back (this account does hit it). `offset`/`page`/`cursor` params were being tried when the API rate-limited us ("Rate..." plain-text, non-JSON body), so pagination is unverified
 - Responses may be wrapped (`{:tasks [...]}` / `{:lists [...]}`) or a bare array; `fetch-tasks`/`fetch-lists` handle both
-- Key fields on tasks: `id`, `title`, `list_id`, `indent_level`, `order_index`, `timeless_due_at`, `label_ids`
+- Key fields on tasks: `id`, `title`, `notes`, `list_id`, `indent_level`, `order_index`, `timeless_due_at`/`due_at`, `timeless_starts_at`/`starts_at`, `label_ids`, `created_at`, `updated_at`, `completed_at`, `cleared_at`
 - Key fields on lists: `id`, `name`, `list_type` (`"list"`, `"inbox"`, `"smart"`, `"folder"`)
 - Only `list_type: "list"` and `"inbox"` can be queried by `list_id`; smart lists and folders cannot
 - Completion is `PATCH {is_complete: true}`
+- The API rate-limits aggressive probing and then returns a plain-text (non-JSON) "Rate..." body; avoid loops of rapid calls when experimenting
 - Due dates: read `timeless_due_at` (date-only) or `due_at` (timed); create with `timeless_due_at`. A `due_date` field is silently ignored by the API (verified).
 - Labels: `POST /tasks` accepts `label_ids` (verified). `--label` / `labels` resolve names (case-insensitive, comma-separated) via `GET /labels`; unknown names are an error. The old `label` field was silently ignored.
 
@@ -97,4 +98,13 @@ Dates: `timeless_*` fields are date-only strings; `due_at`/`starts_at` are UTC t
 
 ### List name resolution
 
-`resolve-list-id` tries exact match first, then case-insensitive. Used by `--list` flag in `gs list` and `gs add`. An unknown name prints "Error: list '<name>' not found" and exits 1.
+`resolve-list-id` (an alias of `find-by-name`, also used for labels) tries exact match first, then case-insensitive. Used by `--list` flag in `gs list` and `gs add`. An unknown name prints "Error: list '<name>' not found" and exits 1.
+
+## Known limitations / open work
+
+- **250-task cap:** no verified pagination (see API section). `done`/`delete` can miss tasks beyond the first 250; commands warn on stderr when the cap is hit. Next step: re-probe `offset`/`page`/`cursor` params slowly, or check the official API docs.
+- **`gs delete` has no confirmation:** a unique match is deleted immediately (mitigated by exact-title preference and `--id`).
+- **Truststore export runs on every invocation** (`security find-certificate` for ~158 certs); could be cached keyed on keychain mtime.
+- **`GET /tasks` also embeds `lists` and `labels`**, so some commands could skip their separate `/lists` and `/labels` calls.
+- **`today-task?` is hard-coded** and won't notice edits to the "My today" smart-list query.
+- **MCP task ids are the only handle** for `complete_task`/`delete_task`; there's no title lookup by design.
