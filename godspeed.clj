@@ -129,12 +129,22 @@
          (and due (<= (compare due today) 0))
          (and start (<= (compare start today) 0))))))
 
+(defn- strip-decoration
+  "Lowercased name without leading emoji/symbols/whitespace ('🏠 Household' -> 'household')."
+  [s]
+  (str/lower-case (str/replace (or s "") #"^[^\p{L}\p{N}]+" "")))
+
 (defn find-by-name
-  "Id of the item whose :name matches name: exact first, then case-insensitive."
+  "Id of the item whose :name matches name: exact first, then case-insensitive,
+   then ignoring leading emoji/symbols (only if that is unambiguous)."
   [name items]
   (or (some #(when (= (:name %) name) (:id %)) items)
       (some #(when (= (str/lower-case (or (:name %) ""))
-                      (str/lower-case name)) (:id %)) items)))
+                      (str/lower-case name)) (:id %)) items)
+      (let [target (strip-decoration name)
+            hits (filter #(= (strip-decoration (:name %)) target) items)]
+        (when (and (not (str/blank? target)) (= 1 (count hits)))
+          (:id (first hits))))))
 
 (defn today-tasks
   "Tasks for 'My today', sorted by due date."
@@ -145,7 +155,28 @@
          (filter #(today-task? % wip-id today))
          (sort-by #(or (due-date %) "9999")))))
 
-(defn resolve-list-id [name lists] (find-by-name name lists))
+(defn taskable-list?
+  "Only plain lists and the inbox can hold tasks; folders and smart lists cannot."
+  [l]
+  (#{"list" "inbox"} (:list_type l)))
+
+(defn resolve-list-id [name lists] (find-by-name name (filter taskable-list? lists)))
+
+(defn lists-with-folders
+  "Non-smart lists in app order, each with :folder (name of the containing
+   folder, or nil). Folder membership is positional: order_index + indent_level."
+  [lists]
+  (loop [items (sort-by :order_index (remove #(= "smart" (:list_type %)) lists))
+         stack []
+         out []]
+    (if-let [l (first items)]
+      (let [stack (vec (drop-while #(>= (:indent_level %) (:indent_level l)) (rseq stack)))
+            stack (vec (reverse stack))
+            out (conj out (assoc l :folder (:name (peek stack))))]
+        (recur (rest items)
+               (if (= "folder" (:list_type l)) (conj stack l) stack)
+               out))
+      out)))
 
 (defn resolve-label-ids
   "Resolve comma-separated label names to ids. Throws if any is unknown."

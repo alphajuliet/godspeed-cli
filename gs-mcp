@@ -38,12 +38,14 @@
 ;; --- Tools ---
 (def tools
   [{:name "list_lists"
-    :description "List Godspeed lists (including the inbox) by name and id."
+    :description "List Godspeed lists in app order, with the folder each belongs to. Includes folders (type \"folder\", e.g. 'Someday/Maybe'), which group lists but cannot hold tasks themselves; use the lists inside them. Smart lists are omitted (they cannot be queried). Archived lists have archived=true. Names may start with an emoji; list arguments elsewhere match with or without it."
     :inputSchema {:type "object" :properties {}}
     :handler (fn [_]
-               (->> (fetch-lists)
-                    (filter #(#{"list" "inbox"} (:list_type %)))
-                    (map #(select-keys % [:id :name]))))}
+               (->> (g/lists-with-folders (fetch-lists))
+                    (map (fn [l]
+                           (cond-> {:id (:id l) :name (:name l) :type (:list_type l)}
+                             (:folder l) (assoc :folder (:folder l))
+                             (:archived_at l) (assoc :archived true))))))}
    {:name "list_tasks"
     :description "List tasks, sorted by order. indent_level shows subtask nesting. Each task includes labels (names), notes, due/start dates, created_at/updated_at (for staleness) and completed_at (for status=complete, e.g. 'done this week'). Max 250 tasks."
     :inputSchema {:type "object"
