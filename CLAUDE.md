@@ -20,7 +20,7 @@ The CLI is a Babashka script (`gs`) plus a shared library (`godspeed.clj`). No b
 
 ### Shared library (`godspeed.clj`)
 
-Holds everything common to `gs` and `gs-mcp`: TLS truststore, the `api` request function (15s timeout; non-2xx → `ex-info` "HTTP <status> from <method> <path>: <body>"), `fetch-tasks`/`fetch-lists`/`fetch-labels`, date helpers, `today-task?`, name→id resolution (`find-by-name`, `resolve-label-ids`) and `fuzzy-match`. Each script adds its own directory (symlinks resolved) to the classpath and requires it. Never print to stdout from the lib (stderr via `warn`). API fixes are now made once, here.
+Holds everything common to `gs` and `gs-mcp`: TLS truststore, the `api` request function (15s timeout; non-2xx → `ex-info` "HTTP <status> from <method> <path>: <body>"), `fetch-tasks`/`fetch-lists`/`fetch-labels`, date helpers, `today-task?`, name→id resolution (`find-by-name`, `resolve-list-id`, `resolve-label-ids`), folder structure (`taskable-list?`, `lists-with-folders`, used by `gs folders` and MCP `list_lists`), `valid-date?` and `fuzzy-match`. Each script adds its own directory (symlinks resolved) to the classpath and requires it. Never print to stdout from the lib (stderr via `warn`). API fixes are now made once, here.
 
 ### MCP server (`gs-mcp`)
 
