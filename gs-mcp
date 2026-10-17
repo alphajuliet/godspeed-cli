@@ -17,6 +17,24 @@
   (or (resolve-list-id name (fetch-lists))
       (throw (ex-info (str "List not found: " name) {}))))
 
+(defn task->map
+  "Task as returned to the MCP client. Nil fields are dropped to keep results small."
+  [t lists labels notes?]
+  (let [label-name (fn [id] (some #(when (= (:id %) id) (:name %)) labels))]
+    (into {}
+          (remove (fn [[_ v]] (or (nil? v) (= v "") (= v []))))
+          {:id (:id t)
+           :title (:title t)
+           :list (some #(when (= (:id %) (:list_id t)) (:name %)) lists)
+           :labels (vec (keep label-name (:label_ids t)))
+           :due (due-date t)
+           :start (start-date t)
+           :indent_level (:indent_level t)
+           :notes (when notes? (:notes t))
+           :created_at (:created_at t)
+           :updated_at (:updated_at t)
+           :completed_at (:completed_at t)})))
+
 ;; --- Tools ---
 (def tools
   [{:name "list_lists"
@@ -27,38 +45,35 @@
                     (filter #(#{"list" "inbox"} (:list_type %)))
                     (map #(select-keys % [:id :name]))))}
    {:name "list_tasks"
-    :description "List tasks, sorted by order. indent_level shows subtask nesting. Max 250 tasks."
+    :description "List tasks, sorted by order. indent_level shows subtask nesting. Each task includes labels (names), notes, due/start dates, created_at/updated_at (for staleness) and completed_at (for status=complete, e.g. 'done this week'). Max 250 tasks."
     :inputSchema {:type "object"
                   :properties {:list {:type "string" :description "List name (optional)"}
-                               :status {:type "string" :enum ["incomplete" "complete"]}}}
-    :handler (fn [{:keys [list status]}]
+                               :status {:type "string" :enum ["incomplete" "complete"]}
+                               :label {:type "string" :description "Only tasks carrying this label name (optional)"}
+                               :include_notes {:type "boolean" :description "Include task notes (default true; set false for a compact result)"}}}
+    :handler (fn [{:keys [list status label include_notes]}]
                (let [lists (fetch-lists)
+                     labels (fetch-labels)
                      list-id (when list (or (resolve-list-id list lists)
-                                        (throw (ex-info (str "List not found: " list) {}))))]
+                                            (throw (ex-info (str "List not found: " list) {}))))
+                     label-id (when label (or (g/find-by-name label labels)
+                                              (throw (ex-info (str "Label not found: " label) {}))))]
                  (->> (fetch-tasks :status status :list-id list-id)
+                      (filter #(or (nil? label-id) (some #{label-id} (:label_ids %))))
                       (sort-by :order_index)
-                      (map (fn [t]
-                             {:id (:id t)
-                              :title (:title t)
-                              :due (or (:timeless_due_at t) (:due_at t))
-                              :indent_level (:indent_level t)
-                              :list (some #(when (= (:id %) (:list_id t)) (:name %)) lists)})))))}
+                      (map #(task->map % lists labels (not (false? include_notes)))))))}
    {:name "today_tasks"
-    :description "Tasks that are actionable now (mirrors the 'My today' smart list): labelled wip, due today or overdue, or start date reached. Sorted by due date."
+    :description "Tasks that are actionable now (mirrors the 'My today' smart list): labelled wip, due today or overdue, or start date reached. Sorted by due date. Same fields as list_tasks."
     :inputSchema {:type "object" :properties {}}
     :handler (fn [_]
                (let [lists (fetch-lists)
-                     wip-id (g/find-by-name "wip" (fetch-labels))
-                     today (str (java.time.LocalDate/now))]
-                 (->> (fetch-tasks)
-                      (filter #(today-task? % wip-id today))
-                      (sort-by #(or (due-date %) "9999"))
-                      (map (fn [t]
-                             {:id (:id t)
-                              :title (:title t)
-                              :due (due-date t)
-                              :start (start-date t)
-                              :list (some #(when (= (:id %) (:list_id t)) (:name %)) lists)})))))}
+                     labels (fetch-labels)]
+                 (->> (g/today-tasks (fetch-tasks) labels)
+                      (map #(task->map % lists labels true)))))}
+   {:name "list_labels"
+    :description "List label names usable with add_task and the list_tasks label filter."
+    :inputSchema {:type "object" :properties {}}
+    :handler (fn [_] (map :name (fetch-labels)))}
    {:name "add_task"
     :description "Create a task."
     :inputSchema {:type "object"
@@ -78,10 +93,6 @@
                             notes (assoc :notes notes)
                             labels (assoc :label_ids (g/resolve-label-ids labels (fetch-labels)))))
                (str "Created: " title))}
-   {:name "list_labels"
-    :description "List label names usable with add_task."
-    :inputSchema {:type "object" :properties {}}
-    :handler (fn [_] (map :name (fetch-labels)))}
    {:name "complete_task"
     :description "Mark a task complete by id (get ids from list_tasks)."
     :inputSchema {:type "object" :properties {:id {:type "string"}} :required ["id"]}

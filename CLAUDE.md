@@ -24,7 +24,7 @@ Holds everything common to `gs` and `gs-mcp`: TLS truststore, the `api` request 
 
 ### MCP server (`gs-mcp`)
 
-`gs-mcp` is a second Babashka script: a stdio MCP server for Claude Desktop (hand-rolled JSON-RPC: `initialize`, `tools/list`, `tools/call`). Tools: `list_lists`, `list_tasks`, `today_tasks`, `list_labels`, `add_task`, `complete_task`, `delete_task`. Unlike `gs`, it works by full task id, not fuzzy title. stdout is reserved for JSON-RPC; never print anything else to it. Malformed input lines get a -32700 reply and handler exceptions a -32603; the loop never dies. `add_task` takes `labels` (comma-separated names) and `list_labels` lists them.
+`gs-mcp` is a second Babashka script: a stdio MCP server for Claude Desktop (hand-rolled JSON-RPC: `initialize`, `tools/list`, `tools/call`). Tools: `list_lists`, `list_tasks`, `today_tasks`, `list_labels`, `add_task`, `complete_task`, `delete_task`. Unlike `gs`, it works by full task id, not fuzzy title. stdout is reserved for JSON-RPC; never print anything else to it. Malformed input lines get a -32700 reply and handler exceptions a -32603; the loop never dies. `list_tasks`/`today_tasks` return `task->map` objects: `labels` (names), `notes`, `due`, `start`, `created_at`, `updated_at`, `completed_at` (nil/empty fields dropped); `list_tasks` also takes `label` (filter) and `include_notes` (default true). `add_task` takes `labels` (comma-separated names) and `list_labels` lists them.
 
 Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 ```json
