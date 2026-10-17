@@ -1,152 +1,20 @@
 #!/usr/bin/env bb
 
 (ns gs
-  (:require [babashka.http-client :as http]
-            [cheshire.core :as json]
-            [clojure.java.shell :as shell]
-            [clojure.string :as str])
-  (:import [java.io ByteArrayInputStream]
-           [java.security KeyStore]
-           [java.security.cert CertificateFactory]
-           [javax.net.ssl SSLContext TrustManagerFactory]))
+  (:require [babashka.classpath :as cp]
+            [clojure.java.io :as io]
+            [clojure.string :as str]))
 
-;; --- Config ---
-(def base-url "https://api.godspeedapp.com")
+;; Shared code lives in godspeed.clj next to this script (resolving symlinks).
+(cp/add-classpath (str (.getParentFile (.getCanonicalFile (io/file *file*)))))
+(require '[godspeed :as g :refer [api fetch-tasks fetch-lists fetch-labels due-date
+                                  resolve-list-id fuzzy-match]])
 
-(defn api-key []
-  (or (System/getenv "GODSPEED_API_KEY")
-      (do (println "Error: GODSPEED_API_KEY environment variable not set")
-          (System/exit 1))))
-
-(defn auth-headers []
-  {"Authorization" (str "Bearer " (api-key))
-   "Content-Type" "application/json"})
-
-;; --- TLS / corporate proxy support ---
-;; Behind a TLS-intercepting proxy (e.g. Zscaler) the server cert is re-signed
-;; by a corporate root CA that lives in the OS keychain, not in bb's bundled
-;; truststore, so handshakes fail with "PKIX path building failed". We build an
-;; SSLContext whose truststore is sourced from $GODSPEED_CA_BUNDLE (a PEM file)
-;; or, on macOS, the keychains: SystemRootCertificates (the public roots) plus
-;; System (where the corporate root lives). Returns nil elsewhere so callers
-;; fall back to bb's default client.
-(def ^:private mac-keychains
-  ["/System/Library/Keychains/SystemRootCertificates.keychain"
-   "/Library/Keychains/System.keychain"])
-
-(defn- read-pem-certs [pem]
-  (when-not (str/blank? pem)
-    (let [cf (CertificateFactory/getInstance "X.509")]
-      (with-open [in (ByteArrayInputStream. (.getBytes pem "UTF-8"))]
-        (vec (.generateCertificates cf in))))))
-
-(defn- ca-certs []
-  (try
-    (if-let [bundle (System/getenv "GODSPEED_CA_BUNDLE")]
-      (read-pem-certs (slurp bundle))
-      (when (str/includes? (str/lower-case (System/getProperty "os.name" "")) "mac")
-        (mapcat (fn [kc]
-                  (let [{:keys [exit out]} (shell/sh "security" "find-certificate" "-a" "-p" kc)]
-                    (when (zero? exit) (read-pem-certs out))))
-                mac-keychains)))
-    (catch Exception _ nil)))
-
-(defn- ssl-context
-  "An SSLContext trusting the resolved CA certs, or nil if none are available
-   (callers then fall back to bb's default client)."
-  []
-  (when-let [certs (seq (ca-certs))]
-    (let [ks (doto (KeyStore/getInstance (KeyStore/getDefaultType)) (.load nil nil))]
-      (doseq [[i c] (map-indexed vector certs)]
-        (.setCertificateEntry ks (str "ca-" i) c))
-      (let [tmf (doto (TrustManagerFactory/getInstance (TrustManagerFactory/getDefaultAlgorithm))
-                  (.init ks))]
-        (doto (SSLContext/getInstance "TLS") (.init nil (.getTrustManagers tmf) nil))))))
-
-(def ^:private http-client
-  (delay (when-let [ctx (ssl-context)] (http/client {:ssl-context ctx}))))
-
-(defn- with-client [opts]
-  (if-let [c @http-client] (assoc opts :client c) opts))
-
-;; --- HTTP helpers ---
-(defn GET [path & {:keys [params]}]
-  (let [url (str base-url path)
-        resp (http/get url (with-client {:headers (auth-headers)
-                                         :query-params (or params {})}))]
-    (json/parse-string (:body resp) true)))
-
-(defn POST [path body]
-  (let [url (str base-url path)
-        resp (http/post url (with-client {:headers (auth-headers)
-                                          :body (json/generate-string body)}))]
-    (json/parse-string (:body resp) true)))
-
-(defn PATCH [path body]
-  (let [url (str base-url path)
-        resp (http/patch url (with-client {:headers (auth-headers)
-                                           :body (json/generate-string body)}))]
-    (json/parse-string (:body resp) true)))
-
-(defn DELETE [path]
-  (let [url (str base-url path)]
-    (http/delete url (with-client {:headers (auth-headers)}))))
+(defn die [& msg]
+  (binding [*out* *err*] (println (str/join " " msg)))
+  (System/exit 1))
 
 ;; --- Task helpers ---
-(defn fetch-tasks [& {:keys [status list-id]}]
-  (let [params (cond-> {"status" (or status "incomplete")
-                        "limit" "250"}
-                 list-id (assoc "list_id" list-id))
-        result (GET "/tasks" :params params)]
-    (or (:tasks result) result [])))
-
-(defn fetch-lists []
-  (let [result (GET "/lists")]
-    (or (:lists result) result [])))
-
-(defn fetch-labels []
-  (let [result (GET "/labels")]
-    (or (:labels result) result [])))
-
-(defn local-date
-  "YYYY-MM-DD string for a timeless date, or for a timed ISO timestamp in the local zone."
-  [timeless at]
-  (or timeless
-      (some-> at java.time.Instant/parse
-              (.atZone (java.time.ZoneId/systemDefault))
-              .toLocalDate str)))
-
-(defn due-date [task] (local-date (:timeless_due_at task) (:due_at task)))
-(defn start-date [task] (local-date (:timeless_starts_at task) (:starts_at task)))
-
-(defn today-task?
-  "Mirrors the 'My today' smart list: label:wip | due<=today | has:start & start<=today."
-  [task wip-id today]
-  (let [due (due-date task)
-        start (start-date task)]
-    (boolean
-     (or (and wip-id (some #{wip-id} (:label_ids task)))
-         (and due (<= (compare due today) 0))
-         (and start (<= (compare start today) 0))))))
-
-(defn today-tasks [tasks labels]
-  (let [wip-id (some #(when (= "wip" (str/lower-case (or (:name %) ""))) (:id %)) labels)
-        today (str (java.time.LocalDate/now))]
-    (->> tasks
-         (filter #(today-task? % wip-id today))
-         (sort-by #(or (due-date %) "9999")))))
-
-(defn resolve-list-id [name lists]
-  ;; exact match first, then case-insensitive
-  (or (some #(when (= (:name %) name) (:id %)) lists)
-      (some #(when (= (str/lower-case (or (:name %) ""))
-                      (str/lower-case name)) (:id %)) lists)))
-
-(defn fuzzy-match [query tasks]
-  (filter #(str/includes? (str/lower-case (or (:title %) ""))
-                          (str/lower-case query))
-          tasks))
-
 (defn short-id [id]
   (subs (str id) 0 (min 5 (count (str id)))))
 
@@ -163,7 +31,10 @@
            (str " [" list-name "]")))))
 
 ;; --- Argument parsing ---
-(defn parse-flags [args]
+(defn parse-flags
+  "`--key value` and `--key=value` set flags; everything else is positional.
+   A flag with no value is an error."
+  [args]
   (loop [remaining args
          flags {}
          positional []]
@@ -172,21 +43,26 @@
       (let [arg (first remaining)
             rest-args (rest remaining)]
         (if (str/starts-with? arg "--")
-          (let [key (keyword (subs arg 2))
-                val (first rest-args)]
-            (recur (rest rest-args) (assoc flags key val) positional))
+          (let [[k inline] (str/split (subs arg 2) #"=" 2)
+                val (if inline inline (first rest-args))
+                rest-args (if inline rest-args (rest rest-args))]
+            (when (nil? val) (die (str "Error: --" k " requires a value")))
+            (recur rest-args (assoc flags (keyword k) val) positional))
           (recur rest-args flags (conj positional arg)))))))
+
+(defn list-id-for [flags lists]
+  (when-let [list-name (:list flags)]
+    (or (resolve-list-id list-name lists)
+        (die (str "Error: list '" list-name "' not found")))))
 
 ;; --- Commands ---
 (defn cmd-list [args]
   (let [flags (parse-flags args)
-        lists (fetch-lists)
-        list-id (when-let [list-name (:list flags)]
-                  (or (resolve-list-id list-name lists)
-                      (do (println (str "Error: list '" (:list flags) "' not found"))
-                          (System/exit 1))))
         status (or (:status flags) "incomplete")
-        tasks (fetch-tasks :status status :list-id list-id)
+        _ (when-not (#{"complete" "incomplete"} status)
+            (die "Error: --status must be 'complete' or 'incomplete'"))
+        lists (fetch-lists)
+        tasks (fetch-tasks :status status :list-id (list-id-for flags lists))
         sorted (sort-by :order_index tasks)
         min-level (if (seq sorted) (apply min (map #(or (:indent_level %) 0) sorted)) 0)]
     (if (empty? sorted)
@@ -196,8 +72,10 @@
           (println (str indent (format-task task lists))))))))
 
 (defn cmd-today [_args]
-  (let [lists (fetch-lists)
-        tasks (today-tasks (fetch-tasks) (fetch-labels))]
+  (let [[lists tasks labels] (map deref [(future (fetch-lists))
+                                         (future (fetch-tasks))
+                                         (future (fetch-labels))])
+        tasks (g/today-tasks tasks labels)]
     (if (empty? tasks)
       (println "Nothing due today.")
       (doseq [task tasks]
@@ -205,71 +83,59 @@
 
 (defn cmd-add [args]
   (let [flags (parse-flags args)
-        positional (:positional flags)
-        title (str/join " " positional)]
-    (when (str/blank? title)
-      (println "Error: task title required")
-      (System/exit 1))
-    (let [lists (fetch-lists)
-          list-id (when-let [list-name (:list flags)]
-                    (or (resolve-list-id list-name lists)
-                        (do (println (str "Error: list '" list-name "' not found"))
-                            (System/exit 1))))
+        title (str/join " " (:positional flags))]
+    (when (str/blank? title) (die "Error: task title required"))
+    (when (and (:due flags) (not (g/valid-date? (:due flags))))
+      (die "Error: --due must be a valid YYYY-MM-DD date"))
+    (let [list-id (when (:list flags) (list-id-for flags (fetch-lists)))
+          label-ids (when (:label flags)
+                      (try (g/resolve-label-ids (:label flags) (fetch-labels))
+                           (catch clojure.lang.ExceptionInfo e
+                             (die (str "Error: " (ex-message e))))))
           body (cond-> {:title title}
                  (:due flags) (assoc :timeless_due_at (:due flags))
                  list-id (assoc :list_id list-id)
                  (:notes flags) (assoc :notes (:notes flags))
-                 (:label flags) (assoc :label (:label flags)))]
-      (POST "/tasks" body)
+                 label-ids (assoc :label_ids label-ids))]
+      (api :post "/tasks" :body body)
       (println (str "Created: " title)))))
 
-(defn cmd-done [args]
-  (let [query (str/join " " args)]
-    (when (str/blank? query)
-      (println "Error: search query required")
-      (System/exit 1))
+(defn pick-task
+  "Find the single incomplete task for a done/delete command, or exit.
+   `--id <prefix>` matches by id prefix; otherwise `query` is a title substring
+   (an exact title match wins over other substring matches)."
+  [args]
+  (let [flags (parse-flags args)
+        query (str/join " " (:positional flags))
+        id-prefix (:id flags)]
+    (when (and (str/blank? query) (str/blank? id-prefix))
+      (die "Error: search query or --id required"))
     (let [lists (fetch-lists)
           tasks (fetch-tasks)
-          matches (fuzzy-match query tasks)]
+          matches (if id-prefix
+                    (filter #(str/starts-with? (str (:id %)) id-prefix) tasks)
+                    (let [ms (fuzzy-match query tasks)
+                          exact (filter #(= (str/lower-case (or (:title %) "")) (str/lower-case query)) ms)]
+                      (if (= 1 (count exact)) exact ms)))]
       (cond
         (empty? matches)
-        (do (println (str "No tasks matching '" query "'"))
-            (System/exit 1))
+        (die (str "No tasks matching '" (or id-prefix query) "'"))
 
         (> (count matches) 1)
-        (do (doseq [task matches]
-              (println (format-task task lists)))
-            (println "Multiple matches — be more specific")
-            (System/exit 1))
+        (do (doseq [task matches] (println (format-task task lists)))
+            (die "Multiple matches — be more specific (or use --id <id prefix>)"))
 
-        :else
-        (let [task (first matches)]
-          (PATCH (str "/tasks/" (:id task)) {:is_complete true})
-          (println (str "Completed: " (:title task) " [" (short-id (:id task)) "]")))))))
+        :else (first matches)))))
+
+(defn cmd-done [args]
+  (let [task (pick-task args)]
+    (api :patch (str "/tasks/" (:id task)) :body {:is_complete true})
+    (println (str "Completed: " (:title task) " [" (short-id (:id task)) "]"))))
 
 (defn cmd-delete [args]
-  (let [query (str/join " " args)]
-    (when (str/blank? query)
-      (println "Error: search query required")
-      (System/exit 1))
-    (let [lists (fetch-lists)
-          tasks (fetch-tasks)
-          matches (fuzzy-match query tasks)]
-      (cond
-        (empty? matches)
-        (do (println (str "No tasks matching '" query "'"))
-            (System/exit 1))
-
-        (> (count matches) 1)
-        (do (doseq [task matches]
-              (println (format-task task lists)))
-            (println "Multiple matches — be more specific")
-            (System/exit 1))
-
-        :else
-        (let [task (first matches)]
-          (DELETE (str "/tasks/" (:id task)))
-          (println (str "Deleted: " (:title task))))))))
+  (let [task (pick-task args)]
+    (api :delete (str "/tasks/" (:id task)))
+    (println (str "Deleted: " (:title task)))))
 
 (defn cmd-lists [_args]
   (let [lists (->> (fetch-lists)
@@ -286,20 +152,31 @@
   (println "  gs list [--list <name>] [--status complete|incomplete]")
   (println "  gs today")
   (println "  gs lists")
-  (println "  gs add <title> [--due YYYY-MM-DD] [--list <name>] [--notes <text>] [--label <name>]")
-  (println "  gs done <query>")
-  (println "  gs delete <query>")
+  (println "  gs add <title> [--due YYYY-MM-DD] [--list <name>] [--notes <text>] [--label <name>[,<name>...]]")
+  (println "  gs done <query> | --id <id prefix>")
+  (println "  gs delete <query> | --id <id prefix>")
   (println)
   (println "Environment:")
-  (println "  GODSPEED_API_KEY  Required. Your Godspeed API key."))
+  (println "  GODSPEED_API_KEY    Required. Your Godspeed API key.")
+  (println "  GODSPEED_CA_BUNDLE  Optional. PEM file of CA certs to trust (corporate proxy)."))
 
 ;; --- Dispatch ---
+(when-not (g/api-key)
+  (die "Error: GODSPEED_API_KEY environment variable not set"))
+
 (let [[cmd & args] *command-line-args*]
-  (case cmd
-    "list"   (cmd-list args)
-    "today"  (cmd-today args)
-    "lists"  (cmd-lists args)
-    "add"    (cmd-add args)
-    "done"   (cmd-done args)
-    "delete" (cmd-delete args)
-    (cmd-help)))
+  (try
+    (case cmd
+      "list"   (cmd-list args)
+      "today"  (cmd-today args)
+      "lists"  (cmd-lists args)
+      "add"    (cmd-add args)
+      "done"   (cmd-done args)
+      "delete" (cmd-delete args)
+      (cmd-help))
+    (catch java.util.concurrent.ExecutionException e
+      (die "Error:" (ex-message (or (ex-cause e) e))))
+    (catch clojure.lang.ExceptionInfo e
+      (die "Error:" (ex-message e)))
+    (catch java.io.IOException e
+      (die "Error: request failed:" (ex-message e)))))

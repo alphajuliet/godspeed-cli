@@ -3,102 +3,15 @@
 ;; stdout is reserved for JSON-RPC; never println anything else.
 
 (ns gs-mcp
-  (:require [babashka.http-client :as http]
+  (:require [babashka.classpath :as cp]
             [cheshire.core :as json]
-            [clojure.java.shell :as shell]
-            [clojure.string :as str])
-  (:import [java.io ByteArrayInputStream]
-           [java.security KeyStore]
-           [java.security.cert CertificateFactory]
-           [javax.net.ssl SSLContext TrustManagerFactory]))
+            [clojure.java.io :as io]
+            [clojure.string :as str]))
 
-(def base-url "https://api.godspeedapp.com")
-
-(defn headers []
-  {"Authorization" (str "Bearer " (System/getenv "GODSPEED_API_KEY"))
-   "Content-Type" "application/json"})
-
-;; --- TLS / corporate proxy support ---
-;; Behind a TLS-intercepting proxy (e.g. Zscaler) the server cert is re-signed
-;; by a corporate root CA that lives in the OS keychain, not in bb's bundled
-;; truststore, so handshakes fail with "PKIX path building failed". We build an
-;; SSLContext whose truststore is sourced from $GODSPEED_CA_BUNDLE (a PEM file)
-;; or, on macOS, the keychains: SystemRootCertificates (the public roots) plus
-;; System (where the corporate root lives). Returns nil elsewhere so callers
-;; fall back to bb's default client.
-(def ^:private mac-keychains
-  ["/System/Library/Keychains/SystemRootCertificates.keychain"
-   "/Library/Keychains/System.keychain"])
-
-(defn- read-pem-certs [pem]
-  (when-not (str/blank? pem)
-    (let [cf (CertificateFactory/getInstance "X.509")]
-      (with-open [in (ByteArrayInputStream. (.getBytes pem "UTF-8"))]
-        (vec (.generateCertificates cf in))))))
-
-(defn- ca-certs []
-  (try
-    (if-let [bundle (System/getenv "GODSPEED_CA_BUNDLE")]
-      (read-pem-certs (slurp bundle))
-      (when (str/includes? (str/lower-case (System/getProperty "os.name" "")) "mac")
-        (mapcat (fn [kc]
-                  (let [{:keys [exit out]} (shell/sh "security" "find-certificate" "-a" "-p" kc)]
-                    (when (zero? exit) (read-pem-certs out))))
-                mac-keychains)))
-    (catch Exception _ nil)))
-
-(defn- ssl-context []
-  (when-let [certs (seq (ca-certs))]
-    (let [ks (doto (KeyStore/getInstance (KeyStore/getDefaultType)) (.load nil nil))]
-      (doseq [[i c] (map-indexed vector certs)]
-        (.setCertificateEntry ks (str "ca-" i) c))
-      (let [tmf (doto (TrustManagerFactory/getInstance (TrustManagerFactory/getDefaultAlgorithm))
-                  (.init ks))]
-        (doto (SSLContext/getInstance "TLS") (.init nil (.getTrustManagers tmf) nil))))))
-
-(def ^:private http-client
-  (delay (when-let [ctx (ssl-context)] (http/client {:ssl-context ctx}))))
-
-(defn api [method path & {:keys [params body]}]
-  (let [resp (http/request (cond-> {:method method
-                                    :uri (str base-url path)
-                                    :headers (headers)
-                                    :query-params (or params {})
-                                    :body (when body (json/generate-string body))}
-                             @http-client (assoc :client @http-client)))]
-    (some-> (:body resp) not-empty (json/parse-string true))))
-
-(defn fetch-lists []
-  (let [r (api :get "/lists")] (or (:lists r) r [])))
-
-(defn fetch-tasks [status list-id]
-  (let [r (api :get "/tasks" :params (cond-> {"status" (or status "incomplete") "limit" "250"}
-                                       list-id (assoc "list_id" list-id)))]
-    (or (:tasks r) r [])))
-
-(defn fetch-labels []
-  (let [r (api :get "/labels")] (or (:labels r) r [])))
-
-(defn local-date [timeless at]
-  (or timeless
-      (some-> at java.time.Instant/parse
-              (.atZone (java.time.ZoneId/systemDefault))
-              .toLocalDate str)))
-
-(defn due-date [t] (local-date (:timeless_due_at t) (:due_at t)))
-(defn start-date [t] (local-date (:timeless_starts_at t) (:starts_at t)))
-
-;; Mirrors the "My today" smart list: label:wip | due<=today | has:start & start<=today
-(defn today-task? [t wip-id today]
-  (let [due (due-date t) start (start-date t)]
-    (boolean
-     (or (and wip-id (some #{wip-id} (:label_ids t)))
-         (and due (<= (compare due today) 0))
-         (and start (<= (compare start today) 0))))))
-
-(defn resolve-list-id [name lists]
-  (or (some #(when (= (:name %) name) (:id %)) lists)
-      (some #(when (= (str/lower-case (or (:name %) "")) (str/lower-case name)) (:id %)) lists)))
+;; Shared code lives in godspeed.clj next to this script (resolving symlinks).
+(cp/add-classpath (str (.getParentFile (.getCanonicalFile (io/file *file*)))))
+(require '[godspeed :as g :refer [api fetch-tasks fetch-lists fetch-labels due-date start-date
+                                  today-task? resolve-list-id]])
 
 (defn lookup-list-id [name]
   (or (resolve-list-id name (fetch-lists))
@@ -120,8 +33,9 @@
                                :status {:type "string" :enum ["incomplete" "complete"]}}}
     :handler (fn [{:keys [list status]}]
                (let [lists (fetch-lists)
-                     list-id (when list (lookup-list-id list))]
-                 (->> (fetch-tasks status list-id)
+                     list-id (when list (or (resolve-list-id list lists)
+                                        (throw (ex-info (str "List not found: " list) {}))))]
+                 (->> (fetch-tasks :status status :list-id list-id)
                       (sort-by :order_index)
                       (map (fn [t]
                              {:id (:id t)
@@ -134,9 +48,9 @@
     :inputSchema {:type "object" :properties {}}
     :handler (fn [_]
                (let [lists (fetch-lists)
-                     wip-id (some #(when (= "wip" (str/lower-case (or (:name %) ""))) (:id %)) (fetch-labels))
+                     wip-id (g/find-by-name "wip" (fetch-labels))
                      today (str (java.time.LocalDate/now))]
-                 (->> (fetch-tasks nil nil)
+                 (->> (fetch-tasks)
                       (filter #(today-task? % wip-id today))
                       (sort-by #(or (due-date %) "9999"))
                       (map (fn [t]
@@ -151,15 +65,23 @@
                   :properties {:title {:type "string"}
                                :list {:type "string" :description "List name (default: inbox)"}
                                :due {:type "string" :description "YYYY-MM-DD"}
-                               :notes {:type "string"}}
+                               :notes {:type "string"}
+                               :labels {:type "string" :description "Comma-separated label names (see list_labels)"}}
                   :required ["title"]}
-    :handler (fn [{:keys [title list due notes]}]
+    :handler (fn [{:keys [title list due notes labels]}]
+               (when (and due (not (g/valid-date? due)))
+                 (throw (ex-info "due must be a valid YYYY-MM-DD date" {})))
                (api :post "/tasks"
                     :body (cond-> {:title title}
                             list (assoc :list_id (lookup-list-id list))
                             due (assoc :timeless_due_at due)
-                            notes (assoc :notes notes)))
+                            notes (assoc :notes notes)
+                            labels (assoc :label_ids (g/resolve-label-ids labels (fetch-labels)))))
                (str "Created: " title))}
+   {:name "list_labels"
+    :description "List label names usable with add_task."
+    :inputSchema {:type "object" :properties {}}
+    :handler (fn [_] (map :name (fetch-labels)))}
    {:name "complete_task"
     :description "Mark a task complete by id (get ids from list_tasks)."
     :inputSchema {:type "object" :properties {:id {:type "string"}} :required ["id"]}
@@ -204,10 +126,19 @@
     ;; notifications (no id) get no reply; unknown requests get an error
     (when id (respond-error id -32601 (str "Method not found: " method)))))
 
-(when-not (System/getenv "GODSPEED_API_KEY")
+(when-not (g/api-key)
   (binding [*out* *err*] (println "GODSPEED_API_KEY not set"))
   (System/exit 1))
 
 (doseq [line (line-seq (java.io.BufferedReader. *in*))
         :when (not (str/blank? line))]
-  (handle (json/parse-string line true)))
+  (try
+    (let [msg (try (json/parse-string line true)
+                   (catch Exception _ ::parse-error))]
+      (if (= msg ::parse-error)
+        (respond-error nil -32700 "Parse error")
+        (try (handle msg)
+             (catch Exception e
+               (when (:id msg) (respond-error (:id msg) -32603 (str "Internal error: " (ex-message e))))))))
+    (catch Throwable t
+      (binding [*out* *err*] (println "gs-mcp: unexpected error:" (ex-message t))))))
