@@ -145,6 +145,16 @@
       (doseq [lst lists]
         (println (:name lst))))))
 
+(defn cmd-folders [_args]
+  (let [items (g/lists-with-folders (fetch-lists))]
+    (if (empty? items)
+      (println "No lists found.")
+      (doseq [l items]
+        (println (str (str/join (repeat (* 2 (or (:indent_level l) 0)) " "))
+                      (:name l)
+                      (when (= "folder" (:list_type l)) "/")
+                      (when (:archived_at l) " (archived)")))))))
+
 (defn cmd-help []
   (println "gs — Godspeed task manager CLI")
   (println)
@@ -152,6 +162,7 @@
   (println "  gs list [--list <name>] [--status complete|incomplete]")
   (println "  gs today")
   (println "  gs lists")
+  (println "  gs folders")
   (println "  gs add <title> [--due YYYY-MM-DD] [--list <name>] [--notes <text>] [--label <name>[,<name>...]]")
   (println "  gs done <query> | --id <id prefix>")
   (println "  gs delete <query> | --id <id prefix>")
@@ -170,6 +181,7 @@
       "list"   (cmd-list args)
       "today"  (cmd-today args)
       "lists"  (cmd-lists args)
+      "folders" (cmd-folders args)
       "add"    (cmd-add args)
       "done"   (cmd-done args)
       "delete" (cmd-delete args)

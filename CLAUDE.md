@@ -72,6 +72,7 @@ Tasks have no `parent_id`. Subtask relationships are encoded positionally via `o
 | `gs list [--list <name>] [--status complete\|incomplete]` | `cmd-list` — fetches and displays tasks (default incomplete), indented |
 | `gs today` | `cmd-today` — what's actionable now; client-side reimplementation of the "My today" smart list (see below) |
 | `gs lists` | `cmd-lists` — prints names of lists with `list_type` `list` or `inbox` (filters out smart/folder types) |
+| `gs folders` | `cmd-folders` — tree of folders (shown with a trailing `/`), lists and the inbox in app order, indented by `indent_level`; archived lists marked; smart lists omitted |
 | `gs add <title> [--due YYYY-MM-DD] [--list <name>] [--notes <text>] [--label <name>[,<name>]]` | `cmd-add` — creates a task; title is all positional args joined by spaces; `--due` is validated |
 | `gs done <query>` or `--id <prefix>` | `cmd-done` — fuzzy-matches title (or id prefix) → marks complete |
 | `gs delete <query>` or `--id <prefix>` | `cmd-delete` — same matching via `pick-task` → deletes |
